@@ -525,31 +525,37 @@ const SERVER = getServerBase();
 
 // ── SERVER CHECK ──────────────────────────────────────────────────────────────
 async function checkServer(){
-  const pill=document.getElementById('srv-pill');
-  const txt=document.getElementById('srv-txt');
-  const warn=document.getElementById('srv-warn');
-  // Render free tier sleeps after 15min — retry up to 10x with 5s gaps (50s total)
-  for(let attempt=1; attempt<=10; attempt++){
-    try{
-      txt.textContent = attempt===1 ? 'Connecting…' : 'Waking server… ('+attempt+'/10)';
-      pill.className='status-pill checking';
-      const c=new AbortController();
-      const t=setTimeout(()=>c.abort(), 8000);
-      const r = await fetch(\`\${SERVER}/health\`, {signal: c.signal});
-      clearTimeout(t);
-      if(r.ok){
-        serverOk=true;
-        pill.className='status-pill ok'; txt.textContent='Server connected';
-        warn.style.display='none';
+  const pill = document.getElementById('srv-pill');
+  const txt  = document.getElementById('srv-txt');
+  const warn = document.getElementById('srv-warn');
+
+  // Try up to 12 times (60 seconds total) — handles Render cold start
+  for(let i = 1; i <= 12; i++){
+    pill.className = 'status-pill checking';
+    txt.textContent = i === 1 ? 'Connecting…' : 'Waking up… (' + i + '/12)';
+    try {
+      // Plain fetch — no AbortController, no signal (avoids cloning errors)
+      const res = await fetch(SERVER + '/health');
+      if(res.ok){
+        serverOk = true;
+        pill.className = 'status-pill ok';
+        txt.textContent = 'Server connected';
+        warn.style.display = 'none';
         fetchAll();
         return;
       }
-    }catch(e){}
-    await new Promise(r=>setTimeout(r,5000));
+    } catch(e) {
+      // Network error — server still waking, keep trying
+      console.log('Check attempt', i, 'failed:', e.message);
+    }
+    // Wait 5s before next attempt
+    await new Promise(ok => setTimeout(ok, 5000));
   }
-  serverOk=false;
-  pill.className='status-pill error'; txt.textContent='Server not running';
-  warn.style.display='block';
+  // All attempts failed
+  serverOk = false;
+  pill.className = 'status-pill error';
+  txt.textContent = 'Server not running';
+  warn.style.display = 'block';
 }
 
 // ── SIDEBAR ───────────────────────────────────────────────────────────────────
