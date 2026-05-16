@@ -362,16 +362,16 @@ body{font-family:var(--font);background:var(--bg);color:var(--txt);font-size:14p
 </div>
 
 <script>
-// ── SOURCES (must match server.js) ────────────────────────────────────────────
+// ── SOURCES (must match server.js) ──────────────────────────────────────────
 const SOURCES = [
-  { id:'mc',   name:'MoneyControl',      color:'#e65c00', initials:'MC', enabled:true },
-  { id:'et',   name:'ET Markets',         color:'#ff6600', initials:'ET', enabled:true },
-  { id:'zee',  name:'Zee Business',       color:'#7b2fff', initials:'ZB', enabled:true },
-  { id:'bs',   name:'Business Standard',  color:'#cc0000', initials:'BS', enabled:true },
-  { id:'lm',   name:'LiveMint',           color:'#0080ff', initials:'LM', enabled:true },
-  { id:'ndtv', name:'NDTV Profit',        color:'#e00000', initials:'NP', enabled:true },
-  { id:'mc2',  name:'MC Technicals',      color:'#e65c00', initials:'M2', enabled:true },
-  { id:'et2',  name:'ET Stocks',          color:'#ff6600', initials:'E2', enabled:true },
+  { id:'et',   name:'ET Markets',          color:'#ff6600', initials:'ET', enabled:true },
+  { id:'et2',  name:'ET Stocks',           color:'#ff6600', initials:'E2', enabled:true },
+  { id:'et3',  name:'ET Hot Stocks',       color:'#ff6600', initials:'E3', enabled:true },
+  { id:'lm',   name:'LiveMint',            color:'#0080ff', initials:'LM', enabled:true },
+  { id:'lm2',  name:'LiveMint Companies',  color:'#0080ff', initials:'L2', enabled:true },
+  { id:'ndtv', name:'NDTV Profit',         color:'#e00000', initials:'NP', enabled:true },
+  { id:'fe',   name:'Financial Express',   color:'#006400', initials:'FE', enabled:true },
+  { id:'inv',  name:'Investing.com IN',    color:'#e84141', initials:'IV', enabled:true },
 ];
 
 // ── TICKER MAP ────────────────────────────────────────────────────────────────
@@ -517,17 +517,25 @@ async function checkServer(){
   const pill=document.getElementById('srv-pill');
   const txt=document.getElementById('srv-txt');
   const warn=document.getElementById('srv-warn');
-  try{
-    const r = await fetch(\`\${SERVER}/api/feeds\`, {method:'GET', signal: (() => { const c=new AbortController(); setTimeout(()=>c.abort(),3000); return c.signal; })()});
-    if(r.ok){
-      serverOk=true;
-      pill.className='status-pill ok'; txt.textContent='Server connected';
-      warn.style.display='none';
-      // Auto-fetch on load if server is running
-      fetchAll();
-      return;
-    }
-  }catch(e){}
+  // Render free tier sleeps after 15min — retry up to 10x with 5s gaps (50s total)
+  for(let attempt=1; attempt<=10; attempt++){
+    try{
+      txt.textContent = attempt===1 ? 'Connecting…' : 'Waking server… ('+attempt+'/10)';
+      pill.className='status-pill checking';
+      const c=new AbortController();
+      const t=setTimeout(()=>c.abort(), 8000);
+      const r = await fetch(\`\${SERVER}/health\`, {signal: c.signal});
+      clearTimeout(t);
+      if(r.ok){
+        serverOk=true;
+        pill.className='status-pill ok'; txt.textContent='Server connected';
+        warn.style.display='none';
+        fetchAll();
+        return;
+      }
+    }catch(e){}
+    await new Promise(r=>setTimeout(r,5000));
+  }
   serverOk=false;
   pill.className='status-pill error'; txt.textContent='Server not running';
   warn.style.display='block';
