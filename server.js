@@ -673,27 +673,30 @@ function parseRecos(full, title, desc, ts, src) {
 function splitIntoSegments(text) {
   const segs = [];
 
-  // Strategy 1: Split on numbered stock patterns — "1. Stock", "2) Stock", "Stock 1:"
+  // Strategy 1: PRIMARY — split on "Buy TICKER in Cash @..." pattern (LiveMint exact format)
+  // Each line like "Buy DABUR in Cash @467 SL @ 444 TGT @ 505" becomes its own segment
+  const buyAtParts = text.split(/(?=\\bBuy\\s+[A-Z]+\\s+(?:in\\s+Cash\\s+)?@)/i);
+  segs.push(...buyAtParts);
+
+  // Strategy 2: Split on stock heading lines — "Dabur\\nBuy DABUR..."  or "Sun Pharma\\nBuy..."
+  const headingParts = text.split(/(?=\\n[A-Z][a-zA-Z\\s]{3,25}\\n(?:Buy|Sell))/);
+  segs.push(...headingParts);
+
+  // Strategy 3: Split on numbered stock patterns
   const numbered = text.split(/(?=\\b\\d+[.)\\s]+(?:[A-Z][a-z]+|buy|sell))|(?=(?:first|second|third|fourth|fifth)\\s+(?:stock|pick|recommendation)\\s*:)/i);
   segs.push(...numbered);
 
-  // Strategy 2: Split on "Stock Name: Buy at..." pattern — each stock gets its own block
-  // Handles: "RBL Bank: Buy at Rs 345, Target Rs 375, SL Rs 330"
+  // Strategy 4: Split on "Stock Name: Buy at..."
   const colonPattern = text.split(/(?=\\b[A-Z][A-Za-z\\s]{2,20}:\\s*(?:buy|sell|accumulate|target))/i);
   segs.push(...colonPattern);
 
-  // Strategy 3: Split on stock transitions — new ticker after previous call ends
-  // "...Stop Loss Rs 330. Hero Motocorp: Buy at..."
-  const stoplossSplit = text.split(/(?<=(?:stop\\s*loss|stoploss|sl)[^.]*\\.\\s*)(?=[A-Z])/i);
-  segs.push(...stoplossSplit);
+  // Strategy 5: Split after TGT line ends (signals end of one stock rec)
+  const tgtSplit = text.split(/(?<=TGT\\s*@\\s*[\\d.]+)\\s*/i);
+  segs.push(...tgtSplit);
 
-  // Strategy 4: Pipe/dash separated lists
-  const pipeSplit = text.split(/\\s*[|]\\s*/);
-  segs.push(...pipeSplit);
-
-  // Strategy 5: Semicolon separated
-  const semiSplit = text.split(/;\\s*/);
-  segs.push(...semiSplit);
+  // Strategy 6: Semicolon and pipe
+  segs.push(...text.split(/;\\s*/));
+  segs.push(...text.split(/\\s*[|]\\s*/));
 
   // Always include full text
   segs.unshift(text);
@@ -765,29 +768,76 @@ function extractOneReco(text, title, ts, src) {
   // Price prefix pattern handles both ₹ and Rs. and Rs
   const P = '(?:₹|Rs\\\\.?\\\\s*)';
 
-  let target = extractAfter([
-    new RegExp('target\\\\s*(?:price|of|at|:|@)?\\\\s*' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
-    new RegExp('(?:tp|tgt)\\\\s*[:\\\\-@]?\\\\s*' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
-    new RegExp('price\\\\s+target\\\\s+(?:of\\\\s+)?' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
-    new RegExp(P + '([\\\\d,]+(?:\\\\.\\\\d{1,2})?)\\\\s*(?:as\\\\s+)?target', 'i'),
-    /Target[:\\s]+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
-  ], clean);
+  // PRIMARY: Match exact LiveMint/ET format: "Buy TICKER in Cash @467 SL @ 444 TGT @ 505"
+  const inlinePat = /buy\\s+\\w+\\s+(?:in\\s+cash\\s+)?@\\s*([\\d.]+)\\s+sl\\s*@\\s*([\\d.]+)\\s+tgt\\s*@\\s*([\\d.]+)/i;
+  const inlineM = clean.match(inlinePat);
+  let entry  = inlineM ? parseFloat(inlineM[1]) : null;
+  let sl     = inlineM ? parseFloat(inlineM[2]) : null;
+  let target = inlineM ? parseFloat(inlineM[3]) : null;
 
-  let sl = extractAfter([
-    new RegExp('stop\\\\s*[-\\\\s]?loss\\\\s*(?:at|of|:|@)?\\\\s*' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
-    new RegExp('stoploss\\\\s*(?:at|of|:|@)?\\\\s*' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
-    new RegExp('\\\\bsl\\\\b\\\\s*(?:at|of|:|@|-)?\\\\s*' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
-    /Stop\\s*Loss[:\\s]+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
-    /SL[:\\s]+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
-  ], clean);
+  // SECONDARY: if inline pattern didn't match, try keyword patterns
+  if (!entry || !target || !sl) {
+    let target2 = extractAfter([
+      /tgt\\s*[@:]?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
+      /target\\s*(?:price|of|at|:|@)?\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
+      /(?:tp|tgt)\\s*[:\\-@]\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
+      /price\\s+target\\s+(?:of\\s+)?(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
+      /(?:₹|Rs\\.?)\\s*([\\d,]+(?:\\.\\d{1,2})?)\\s*(?:as\\s+)?target/i,
+      /target[:\\s]+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
+    ], clean);
+    let sl2 = extractAfter([
+      /sl\\s*@\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
+      /stop\\s*[-\\s]?loss\\s*(?:at|of|:|@)?\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
+      /stoploss\\s*(?:at|of|:|@)?\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
+      /\\bsl\\b\\s*(?:at|of|:|@|-|@)?\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
+      /stop\\s*loss[:\\s]+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
+    ], clean);
+    let entry2 = extractAfter([
+      /buy\\s+(?:\\w+\\s+)?(?:in\\s+cash\\s+)?@\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
+      /buy\\s*(?:at|@|around|near|above|below)?\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
+      /entry\\s*(?:at|@|:)?\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
+      /\\bcmp\\b\\s*[:\\-@]?\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
+      /buy\\s+at\\s+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
+      /trading\\s+(?:at|around|near)\\s+(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
+    ], clean);
+    if (!target && target2) target = target2;
+    if (!sl && sl2) sl = sl2;
+    if (!entry && entry2) entry = entry2;
+  }
 
-  let entry = extractAfter([
-    new RegExp('(?:buy|entry|enter)\\\\s*(?:at|@|around|near|above|below|price)?\\\\s*' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
-    new RegExp('\\\\bcmp\\\\b\\\\s*[:\\\\-@]?\\\\s*' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
-    new RegExp(P + '([\\\\d,]+(?:\\\\.\\\\d{1,2})?)\\\\s*(?:entry|for\\\\s+(?:buying|entry))', 'i'),
-    /Buy\\s+at\\s+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
-    /current\\s+(?:market\\s+)?price[:\\s]+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
-  ], clean);
+  // TERTIARY: collect all @ prices and assign by position
+  if (!entry || !target || !sl) {
+    const atPrices = [];
+    const atRe = /@\\s*([\\d,]+(?:\\.\\d{1,2})?)/g;
+    let atm;
+    while ((atm = atRe.exec(clean)) !== null) {
+      const v = parseFloat(atm[1].replace(/,/g,''));
+      if (v > 1 && v < 2000000) atPrices.push(v);
+    }
+    // Format: @entry @sl @target  (3 @ signs in order)
+    if (atPrices.length >= 3) {
+      if (!entry)  entry  = atPrices[0];
+      if (!sl)     sl     = atPrices[1];
+      if (!target) target = atPrices[2];
+    } else if (atPrices.length === 2) {
+      if (!entry)  entry  = atPrices[0];
+      if (!target) target = atPrices[1];
+    }
+  }
+
+  // QUATERNARY: collect all ₹/Rs amounts
+  if (!entry || !target) {
+    const allPrices = [];
+    const priceRe = /(?:₹|Rs\\.?)\\s*([\\d,]+(?:\\.\\d{1,2})?)/gi;
+    let pm;
+    while ((pm = priceRe.exec(clean)) !== null) {
+      const v = parseFloat(pm[1].replace(/,/g,''));
+      if (v > 1 && v < 2000000) allPrices.push(v);
+    }
+    const unique = [...new Set(allPrices)].sort((a,b)=>a-b);
+    if (action === 'BUY')  { if (!entry) entry=unique[0]; if (!target) target=unique[unique.length-1]; }
+    if (action === 'SELL') { if (!entry) entry=unique[unique.length-1]; if (!target) target=unique[0]; }
+  }
 
   // Last resort: collect all ₹ amounts and assign by position/logic
   if (!entry || !target) {
