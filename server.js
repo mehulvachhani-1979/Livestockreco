@@ -639,243 +639,172 @@ function parseXML(xmlText, srcId){
   }catch(e){ return []; }
 }
 
-// ── RECOMMENDATION PARSER — multi-stock, full extraction ─────────────────────
+// ── RECOMMENDATION PARSER ─────────────────────────────────────────────────────
 
-// Returns ARRAY of reco objects (one article can have 2-3 stocks)
-function parseRecos(full, title, desc, ts, src) {
-  const results = [];
+// Blacklist — words that look like tickers but aren't
+const NOT_TICKERS = new Set([
+  'BUY','SELL','THE','AND','FOR','WITH','STOP','LOSS','TARGET','PRICE',
+  'NEAR','ABOVE','BELOW','CASH','ALSO','READ','THIS','THAT','FROM','HAVE',
+  'BEEN','WILL','ONLY','INTO','OVER','SOME','EACH','BOTH','THEY','WERE',
+  'SAID','SAYS','SUCH','THEN','THAN','WHEN','YOUR','THEIR','ABOUT','AFTER',
+  'WHICH','WHILE','WHERE','WOULD','COULD','SHOULD','STOCKS','SHARES','STOCK',
+  'MARKET','NIFTY','SENSEX','INDEX','TODAY','WEEK','MONTH','YEAR','NEXT',
+  'LAST','HIGH','LOWS','RISE','FALL','GAIN','LOSS','PROFIT','BOOK','CALL',
+  'PICK','VIEW','RATE','FUND','BANK','DATA','NEWS','LIVE','GOLD','CRUDE',
+  'RUPEE','DOLLAR','INDIA','GLOBAL','TRADE','UNDER','SHORT','LONG','TERM',
+  'FRESH','RALLY','TREND','LEVEL','RANGE','ZONE','BAND','ZONE','MOVE',
+  'HOLD','EXIT','AVOID','WATCH','TRACK','NOTE','TIPS','IDEA','IDEAS',
+  'SUGARS','ENERGY','MOTORS','PHARMA','TECH','INFRA','REALTY','METALS',
+  'SUGAR','CEMENT','STEEL','POWER','MEDIA','FOODS','FIBER','CHEM','LABS',
+  'CORP','INDS','READ','CLICK','HERE','MORE','ALSO','LIKE','JUST','EVEN',
+  'WERE','DAYS','WEEK','GETS','HITS','SETS','SEES','CUTS','WINS','ADDS',
+]);
 
-  // ── Step 1: Split article into per-stock segments ──────────────────────────
-  // Articles often say "Buy A with target X, SL Y; Buy B with target P, SL Q"
-  // Split on sentence boundaries or semicolons or stock transitions
-  const segments = splitIntoSegments(full);
-
-  // ── Step 2: Extract from each segment ──────────────────────────────────────
-  for (const seg of segments) {
-    const rec = extractOneReco(seg, title, ts, src);
-    if (rec) {
-      // Avoid duplicate tickers in same article
-      if (!results.find(r => r.ticker === rec.ticker)) {
-        results.push(rec);
-      }
-    }
+// Extract ONLY the specific recommendation line/sentence for a stock
+function extractQuoteForStock(ticker, cname, fullText) {
+  const lines = fullText.split(/
+|(?<=\\.)\\s+(?=[A-Z])/);
+  
+  // Priority 1: Find line with exact ticker + buy/sell + price
+  // e.g. "Buy DABUR in Cash @467 SL @ 444 TGT @ 505"
+  for (const line of lines) {
+    const l = line.trim();
+    if (l.length < 10) continue;
+    const hasStock = new RegExp('\\\\b(' + ticker + '|' + cname.split(' ')[0] + ')\\\\b', 'i').test(l);
+    const hasAction = /\\b(buy|sell|accumulate|exit|reduce|target|sl|tgt|stop.?loss)\\b/i.test(l);
+    const hasPrice = /[@₹]\\s*[\\d]|Rs\\.?\\s*[\\d]|\\d+\\s*(?:tgt|sl|target)/i.test(l);
+    if (hasStock && hasAction && hasPrice) return l.trim();
+  }
+  
+  // Priority 2: Line with stock name + action (no price required)
+  for (const line of lines) {
+    const l = line.trim();
+    if (l.length < 10 || l.length > 300) continue;
+    const hasStock = new RegExp('\\\\b(' + ticker + '|' + cname.split(' ')[0] + ')\\\\b', 'i').test(l);
+    const hasAction = /\\b(buy|sell|accumulate|exit|reduce|bullish|bearish|target|stop.?loss)\\b/i.test(l);
+    if (hasStock && hasAction) return l.trim();
   }
 
-  // If segmented extraction got nothing, try whole article
+  // Priority 3: Numbered rec line "1] Stock : Buy near ₹24, Target ₹27, SL ₹22"
+  const numRe = new RegExp('\\\\d+[\\\\].)\\\\s]+' + cname.split(' ')[0] + '[^.]{0,200}', 'i');
+  const numM = fullText.match(numRe);
+  if (numM) return numM[0].trim().substring(0, 200);
+
+  return null; // no clean quote found
+}
+
+// Extract ALL stock recommendations from an article — returns array
+function parseRecos(full, title, desc, ts, src) {
+  const results = [];
+  const seen = new Set();
+
+  // Split into candidate sentences/lines
+  const lines = full
+    .replace(/\\r/g, '')
+    .split(/\\n+/)
+    .flatMap(l => l.split(/(?<=\\.\\s)(?=[A-Z])/))
+    .map(l => l.trim())
+    .filter(l => l.length > 10);
+
+  for (const line of lines) {
+    // Must have an action signal
+    const isBuy  = /\\b(buy|accumulate|add|bullish|go long|initiate buy|upgrade.*buy|strong buy)\\b/i.test(line);
+    const isSell = /\\b(sell|exit|reduce|bearish|short|initiate sell|downgrade.*sell|book profit)\\b/i.test(line);
+    if (!isBuy && !isSell) continue;
+
+    // Must have a price signal
+    const hasPrice = /[@₹]\\s*[\\d]|Rs\\.?\\s*[\\d]|\\btarget\\b|\\bsl\\b|\\btgt\\b|stop.?loss/i.test(line);
+    if (!hasPrice) continue;
+
+    // Must mention a known ticker or company
+    let ticker = null, cname = null;
+    for (const [re, sym, cn] of TICKER_MAP) {
+      if (re.test(line)) { ticker = sym; cname = cn; break; }
+    }
+
+    // Fallback: "Buy XXXX in Cash" — XXXX is the ticker
+    if (!ticker) {
+      const m = line.match(/\\b(?:buy|sell)\\s+([A-Z]{3,12})\\s+(?:in\\s+cash|futures?|@|at)/i);
+      if (m && !NOT_TICKERS.has(m[1].toUpperCase())) {
+        ticker = m[1].toUpperCase();
+        cname  = ticker;
+      }
+    }
+
+    if (!ticker || seen.has(ticker)) continue;
+    seen.add(ticker);
+
+    const action = isBuy ? 'BUY' : 'SELL';
+
+    // Extract the cleanest possible quote — just the rec sentence
+    const quote = extractQuoteForStock(ticker, cname, full) || line.trim();
+
+    // Extract prices from the quote line
+    const clean = quote.replace(/Rs\\.?\\s*/gi,'₹');
+    
+    const inlineM = clean.match(/buy\\s+\\w+\\s+(?:in\\s+cash\\s+)?@\\s*([\\d.]+)\\s+sl\\s*@\\s*([\\d.]+)\\s+tgt\\s*@\\s*([\\d.]+)/i);
+    let entry  = inlineM ? parseFloat(inlineM[1]) : null;
+    let sl     = inlineM ? parseFloat(inlineM[2]) : null;
+    let target = inlineM ? parseFloat(inlineM[3]) : null;
+
+    if (!entry || !target || !sl) {
+      const getNum = (patterns, text) => {
+        for (const re of patterns) {
+          const m = text.match(re);
+          if (m) { const v = parseFloat((m[1]||'').replace(/,/g,'')); if (v>1&&v<2000000) return v; }
+        }
+        return null;
+      };
+      if (!target) target = getNum([/tgt\\s*[@:]?\\s*(?:₹)?\\s*([\\d,]+)/i, /target\\s*(?:price|of|at|:)?\\s*(?:₹)?\\s*([\\d,]+)/i, /(?:₹)\\s*([\\d,]+)\\s*(?:as\\s+)?target/i, /Target\\s+(?:₹)?([\\d,]+)/i], clean);
+      if (!sl)     sl     = getNum([/sl\\s*[@:]?\\s*(?:₹)?\\s*([\\d,]+)/i, /stop.?loss\\s*(?:at|of|:)?\\s*(?:₹)?\\s*([\\d,]+)/i, /Stop\\s+Loss\\s+(?:₹)?([\\d,]+)/i], clean);
+      if (!entry)  entry  = getNum([/buy\\s+(?:\\w+\\s+)?(?:in\\s+cash\\s+)?@\\s*([\\d,]+)/i, /buy\\s*(?:near|at|@|around)?\\s*(?:₹)?\\s*([\\d,]+)/i, /buy\\s+only\\s+above\\s+(?:₹)?([\\d,]+)/i], clean);
+      // @ signs in order: entry, sl, target
+      if (!entry||!sl||!target) {
+        const ats=[]; const atRe=/@\\s*([\\d,]+(?:\\.[\\d]+)?)/g; let atm;
+        while((atm=atRe.exec(clean))!==null){ const v=parseFloat(atm[1].replace(/,/g,'')); if(v>1&&v<2000000) ats.push(v); }
+        if(ats.length>=3){if(!entry)entry=ats[0];if(!sl)sl=ats[1];if(!target)target=ats[2];}
+        else if(ats.length===2){if(!entry)entry=ats[0];if(!target)target=ats[1];}
+        else if(ats.length===1){if(!entry)entry=ats[0];}
+      }
+    }
+
+    // Anchor from full article
+    let anchor = 'Market Desk';
+    const fl = full.toLowerCase();
+    for (const name of KNOWN_ANCHORS) {
+      if (fl.includes(name.toLowerCase())) { anchor = name; break; }
+    }
+
+    results.push({
+      ticker, cname, action,
+      entry: entry||null, sl: sl||null, target: target||null,
+      anchor,
+      rawText: quote.substring(0, 300), // ONLY the specific rec sentence
+      snippet: title || quote.substring(0, 120),
+      ts
+    });
+  }
+
+  // If line-based found nothing, try full text with known tickers only
   if (results.length === 0) {
-    const rec = extractOneReco(full, title, ts, src);
-    if (rec) results.push(rec);
+    for (const [re, sym, cn] of TICKER_MAP) {
+      if (!re.test(full)) continue;
+      if (seen.has(sym)) continue;
+      const isBuy  = /\\b(buy|accumulate|bullish|target)\\b/i.test(full);
+      const isSell = /\\b(sell|bearish|exit|reduce)\\b/i.test(full);
+      if (!isBuy && !isSell) continue;
+      const quote = extractQuoteForStock(sym, cn, full);
+      if (!quote) continue;
+      seen.add(sym);
+      results.push({ ticker:sym, cname:cn, action:isBuy?'BUY':'SELL', entry:null, sl:null, target:null, anchor:'Market Desk', rawText:quote, snippet:title||quote.substring(0,120), ts });
+      if (results.length >= 5) break;
+    }
   }
 
   return results;
 }
 
-function splitIntoSegments(text) {
-  const segs = [];
-
-  // Strategy 1: PRIMARY — split on "Buy TICKER in Cash @..." pattern (LiveMint exact format)
-  // Each line like "Buy DABUR in Cash @467 SL @ 444 TGT @ 505" becomes its own segment
-  const buyAtParts = text.split(/(?=\\bBuy\\s+[A-Z]+\\s+(?:in\\s+Cash\\s+)?@)/i);
-  segs.push(...buyAtParts);
-
-  // Strategy 2: Split on stock heading lines — "Dabur\\nBuy DABUR..."  or "Sun Pharma\\nBuy..."
-  const headingParts = text.split(/(?=\\n[A-Z][a-zA-Z\\s]{3,25}\\n(?:Buy|Sell))/);
-  segs.push(...headingParts);
-
-  // Strategy 3: Split on numbered stock patterns
-  const numbered = text.split(/(?=\\b\\d+[.)\\s]+(?:[A-Z][a-z]+|buy|sell))|(?=(?:first|second|third|fourth|fifth)\\s+(?:stock|pick|recommendation)\\s*:)/i);
-  segs.push(...numbered);
-
-  // Strategy 4: Split on "Stock Name: Buy at..."
-  const colonPattern = text.split(/(?=\\b[A-Z][A-Za-z\\s]{2,20}:\\s*(?:buy|sell|accumulate|target))/i);
-  segs.push(...colonPattern);
-
-  // Strategy 5: Split after TGT line ends (signals end of one stock rec)
-  const tgtSplit = text.split(/(?<=TGT\\s*@\\s*[\\d.]+)\\s*/i);
-  segs.push(...tgtSplit);
-
-  // Strategy 6: Semicolon and pipe
-  segs.push(...text.split(/;\\s*/));
-  segs.push(...text.split(/\\s*[|]\\s*/));
-
-  // Always include full text
-  segs.unshift(text);
-
-  return [...new Set(segs)].map(s => s.trim()).filter(s => s.length > 15);
-}
-
-function extractOneReco(text, title, ts, src) {
-  const t = text.toLowerCase();
-
-  // ── Action detection ────────────────────────────────────────────────────────
-  const isBuy  = /\\b(buy|buying|accumulate|add|bullish|long|go long|initiat(e|es|ing) buy|upgrade.*buy|maintain.*buy|strong buy|top pick|best buy|recommended buy|trading buy|invest)\\b/.test(text);
-  const isSell = /\\b(sell|selling|short|exit|reduce|bearish|avoid|downgrade.*sell|initiat(e|es|ing) sell|book profit|book loss)\\b/.test(text);
-  const isWatch= /\\b(watch|watchlist|neutral|hold|tracking|monitor|top pick|hot stock|trade setup|trading idea|stock idea|analyst pick)\\b/.test(text);
-
-  if (!isBuy && !isSell && !isWatch) return null;
-  const action = isBuy ? 'BUY' : isSell ? 'SELL' : 'WATCH';
-
-  // ── Ticker extraction ───────────────────────────────────────────────────────
-  let ticker = null, cname = null;
-
-  // 1. Try known ticker map
-  for (const [re, sym, cn] of TICKER_MAP) {
-    if (re.test(text)) { ticker = sym; cname = cn; break; }
-  }
-
-  // 2. Pattern: "Buy XYZ" / "Sell XYZ" / "XYZ: Buy"
-  if (!ticker) {
-    const patterns = [
-      /\\b(?:buy|sell|accumulate|add)\\s+([A-Z][A-Za-z&]{2,15})\\b/,
-      /\\b([A-Z][A-Za-z&]{2,15})\\s*[:|]\\s*(?:buy|sell|target)/i,
-      /\\b([A-Z][A-Za-z&]{2,15})\\s+(?:shares?|stock|scrip|futures?)\\b/i,
-      /\\b([A-Z]{3,10})\\s+(?:at|@|around|near)\\s*(?:₹|rs\\.?)?\\s*[\\d,]+/,
-    ];
-    for (const p of patterns) {
-      const m = text.match(p);
-      if (m && m[1] && m[1].length >= 3 && !/^(buy|sell|the|and|for|with|stop|loss|target|price|near|above|below)$/i.test(m[1])) {
-        ticker = m[1].toUpperCase();
-        cname  = m[1];
-        break;
-      }
-    }
-  }
-
-  if (!ticker) return null;
-
-  // ── Price extraction ─────────────────────────────────────────────────────────
-  // Clean text: remove HTML, normalise ₹ and Rs
-  const clean = text
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/Rs\\.?\\s*/gi, '₹')
-    .replace(/INR\\s*/gi,   '₹')
-    .replace(/rupees?\\s*/gi,'₹');
-
-  // Helper: extract number after a keyword
-  function extractAfter(patterns, str) {
-    for (const re of patterns) {
-      const m = str.match(re);
-      if (m) {
-        // grab first capture group that is a number
-        const raw = m[1] || m[2] || m[3] || '0';
-        const v = parseFloat(raw.replace(/,/g, ''));
-        if (v > 1 && v < 2000000) return v;
-      }
-    }
-    return null;
-  }
-
-  // Price prefix pattern handles both ₹ and Rs. and Rs
-  const P = '(?:₹|Rs\\\\.?\\\\s*)';
-
-  // PRIMARY: Match exact LiveMint/ET format: "Buy TICKER in Cash @467 SL @ 444 TGT @ 505"
-  const inlinePat = /buy\\s+\\w+\\s+(?:in\\s+cash\\s+)?@\\s*([\\d.]+)\\s+sl\\s*@\\s*([\\d.]+)\\s+tgt\\s*@\\s*([\\d.]+)/i;
-  const inlineM = clean.match(inlinePat);
-  let entry  = inlineM ? parseFloat(inlineM[1]) : null;
-  let sl     = inlineM ? parseFloat(inlineM[2]) : null;
-  let target = inlineM ? parseFloat(inlineM[3]) : null;
-
-  // SECONDARY: if inline pattern didn't match, try keyword patterns
-  if (!entry || !target || !sl) {
-    let target2 = extractAfter([
-      /tgt\\s*[@:]?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
-      /target\\s*(?:price|of|at|:|@)?\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
-      /(?:tp|tgt)\\s*[:\\-@]\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
-      /price\\s+target\\s+(?:of\\s+)?(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
-      /(?:₹|Rs\\.?)\\s*([\\d,]+(?:\\.\\d{1,2})?)\\s*(?:as\\s+)?target/i,
-      /target[:\\s]+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
-    ], clean);
-    let sl2 = extractAfter([
-      /sl\\s*@\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
-      /stop\\s*[-\\s]?loss\\s*(?:at|of|:|@)?\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
-      /stoploss\\s*(?:at|of|:|@)?\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
-      /\\bsl\\b\\s*(?:at|of|:|@|-|@)?\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
-      /stop\\s*loss[:\\s]+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
-    ], clean);
-    let entry2 = extractAfter([
-      /buy\\s+(?:\\w+\\s+)?(?:in\\s+cash\\s+)?@\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
-      /buy\\s*(?:at|@|around|near|above|below)?\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
-      /entry\\s*(?:at|@|:)?\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
-      /\\bcmp\\b\\s*[:\\-@]?\\s*(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
-      /buy\\s+at\\s+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
-      /trading\\s+(?:at|around|near)\\s+(?:₹|Rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/i,
-    ], clean);
-    if (!target && target2) target = target2;
-    if (!sl && sl2) sl = sl2;
-    if (!entry && entry2) entry = entry2;
-  }
-
-  // TERTIARY: collect all @ prices and assign by position
-  if (!entry || !target || !sl) {
-    const atPrices = [];
-    const atRe = /@\\s*([\\d,]+(?:\\.\\d{1,2})?)/g;
-    let atm;
-    while ((atm = atRe.exec(clean)) !== null) {
-      const v = parseFloat(atm[1].replace(/,/g,''));
-      if (v > 1 && v < 2000000) atPrices.push(v);
-    }
-    // Format: @entry @sl @target  (3 @ signs in order)
-    if (atPrices.length >= 3) {
-      if (!entry)  entry  = atPrices[0];
-      if (!sl)     sl     = atPrices[1];
-      if (!target) target = atPrices[2];
-    } else if (atPrices.length === 2) {
-      if (!entry)  entry  = atPrices[0];
-      if (!target) target = atPrices[1];
-    }
-  }
-
-  // QUATERNARY: collect all ₹/Rs amounts
-  if (!entry || !target) {
-    const allPrices = [];
-    const priceRe = /(?:₹|Rs\\.?)\\s*([\\d,]+(?:\\.\\d{1,2})?)/gi;
-    let pm;
-    while ((pm = priceRe.exec(clean)) !== null) {
-      const v = parseFloat(pm[1].replace(/,/g,''));
-      if (v > 1 && v < 2000000) allPrices.push(v);
-    }
-    const unique = [...new Set(allPrices)].sort((a,b)=>a-b);
-    if (action === 'BUY')  { if (!entry) entry=unique[0]; if (!target) target=unique[unique.length-1]; }
-    if (action === 'SELL') { if (!entry) entry=unique[unique.length-1]; if (!target) target=unique[0]; }
-  }
-
-  // Last resort: collect all ₹ amounts and assign by position/logic
-  if (!entry || !target) {
-    const allPrices = [];
-    const priceRe = /(?:₹|@\\s*)([\\d,]+(?:\\.\\d{1,2})?)/g;
-    let pm;
-    while ((pm = priceRe.exec(clean)) !== null) {
-      const v = parseFloat(pm[1].replace(/,/g,''));
-      if (v > 1 && v < 2000000) allPrices.push(v);
-    }
-    const unique = [...new Set(allPrices)].sort((a,b)=>a-b);
-    if (unique.length >= 2) {
-      if (action === 'BUY')  { if (!entry) entry = unique[0]; if (!target) target = unique[unique.length-1]; }
-      if (action === 'SELL') { if (!entry) entry = unique[unique.length-1]; if (!target) target = unique[0]; }
-    } else if (unique.length === 1) {
-      if (!target) target = unique[0];
-    }
-  }
-
-  // ── Anchor extraction ────────────────────────────────────────────────────────
-  let anchor = 'Market Desk';
-  const tl = text.toLowerCase();
-  for (const name of KNOWN_ANCHORS) {
-    if (tl.includes(name.toLowerCase())) { anchor = name; break; }
-  }
-  if (anchor === 'Market Desk') {
-    // "Rahul Shah of Motilal recommends" / "said Kunal Shah"
-    const am = text.match(/([A-Z][a-z]+(?: [A-Z][a-z]+){1,3})\\s+(?:of\\s+[\\w\\s]+?\\s+)?(?:recommends?|suggests?|says?|advises?|told|picks?)/);
-    if (am) anchor = am[1];
-  }
-
-  const snippet = (title && title.length > 10 ? title : text).substring(0, 180);
-  // Store the raw segment text — shown directly in the card
-  const rawText = text.length > 30 ? text.substring(0, 600) : (title||'');
-  return { ticker, cname, action, entry: entry||null, sl: sl||null, target: target||null, anchor, snippet, rawText, ts };
-}
-
-// Legacy single-call wrapper (for backward compat)
+// Legacy wrapper
 function parseReco(full, title, desc, ts, src) {
   const arr = parseRecos(full, title, desc, ts, src);
   return arr.length > 0 ? arr[0] : null;
