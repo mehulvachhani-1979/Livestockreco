@@ -46,6 +46,54 @@ function fetchUrl(targetUrl, redirectCount) {
 
 const cache = { data: null, ts: 0, TTL: 10 * 60 * 1000 };
 
+// Fetch full article HTML and extract text content
+async function fetchArticleText(articleUrl) {
+  try {
+    const { status, body } = await fetchUrl(articleUrl);
+    if (status !== 200) return '';
+    // Strip scripts, styles, nav, footer
+    let text = body
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<nav[\s\S]*?<\/nav>/gi, ' ')
+      .replace(/<footer[\s\S]*?<\/footer>/gi, ' ')
+      .replace(/<header[\s\S]*?<\/header>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&nbsp;/g,' ').replace(/&#[\d]+;/g,' ')
+      .replace(/\s+/g, ' ').trim();
+    return text.substring(0, 8000); // cap at 8KB per article
+  } catch(e) {
+    return '';
+  }
+}
+
+// Parse XML and return items with link
+function parseRSSItems(xml) {
+  const items = [];
+  const itemRe = /<item>([\s\S]*?)<\/item>/g;
+  let im;
+  while ((im = itemRe.exec(xml)) !== null) {
+    const chunk = im[1];
+    const getTag = (tag) => {
+      const m = chunk.match(new RegExp('<' + tag + '>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?<\\/' + tag + '>', 'i'));
+      return m ? m[1].trim() : '';
+    };
+    const title   = getTag('title');
+    const desc    = chunk.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim().substring(0, 500);
+    const link    = getTag('link') || getTag('guid');
+    const pubDate = getTag('pubDate') || getTag('published');
+    const ts      = pubDate ? new Date(pubDate).getTime() : Date.now();
+    if (title) items.push({ title, desc, link, ts: isNaN(ts) ? Date.now() : ts });
+  }
+  return items;
+}
+
+// Keywords that indicate this article likely has full stock details inside
+function likelyHasDetailedCalls(title, desc) {
+  const text = (title + ' ' + desc).toLowerCase();
+  return /recommends?\s+(\d+|two|three|four|five|six)\s+stock|stocks?\s+to\s+buy|buy\s+or\s+sell|trading\s+(ideas?|calls?|picks?)|top\s+(picks?|stocks?)|stock\s+picks?\s+today|breakout\s+stocks?/.test(text);
+}
+
 async function getAllFeeds() {
   if (cache.data && (Date.now() - cache.ts) < cache.TTL) {
     console.log('Serving cached feeds');
@@ -53,12 +101,53 @@ async function getAllFeeds() {
   }
   console.log('Fetching RSS feeds...');
   const results = [];
+
   for (const feed of RSS_FEEDS) {
     process.stdout.write('  ' + feed.name + '... ');
     try {
       const { status, body } = await fetchUrl(feed.url);
       console.log('HTTP', status, body.length + 'b');
-      results.push({ id: feed.id, name: feed.name, color: feed.color, initials: feed.initials, status, xml: body });
+      if (status !== 200) {
+        results.push({ id: feed.id, name: feed.name, color: feed.color, initials: feed.initials, status, xml: '', error: 'HTTP ' + status });
+        continue;
+      }
+
+      // Parse RSS items
+      const rssItems = parseRSSItems(body);
+      console.log('    ' + rssItems.length + ' items in RSS');
+
+      // For articles likely containing multiple stock calls, fetch full page
+      const enrichedItems = [];
+      for (const item of rssItems.slice(0, 20)) {
+        let fullText = item.title + ' ' + item.desc;
+        if (likelyHasDetailedCalls(item.title, item.desc) && item.link && item.link.startsWith('http')) {
+          process.stdout.write('      Fetching full article: ' + item.title.substring(0,50) + '...');
+          const articleText = await fetchArticleText(item.link);
+          if (articleText.length > 200) {
+            fullText = item.title + ' ' + articleText;
+            process.stdout.write(' (' + articleText.length + 'b)\n');
+          } else {
+            process.stdout.write(' FAILED\n');
+          }
+          // Small delay to be respectful
+          await new Promise(r => setTimeout(r, 300));
+        }
+        enrichedItems.push({ ...item, fullText });
+      }
+
+      // Build synthetic XML from enriched items so client parser gets full text
+      const syntheticXml = '<rss><channel>' +
+        enrichedItems.map(item =>
+          '<item>' +
+          '<title><![CDATA[' + item.title + ']]></title>' +
+          '<description><![CDATA[' + item.fullText + ']]></description>' +
+          '<link>' + (item.link||'') + '</link>' +
+          '<pubDate>' + new Date(item.ts).toUTCString() + '</pubDate>' +
+          '</item>'
+        ).join('') +
+        '</channel></rss>';
+
+      results.push({ id: feed.id, name: feed.name, color: feed.color, initials: feed.initials, status: 200, xml: syntheticXml });
     } catch(e) {
       console.log('ERROR:', e.message);
       results.push({ id: feed.id, name: feed.name, color: feed.color, initials: feed.initials, status: 0, xml: '', error: e.message });
@@ -582,16 +671,34 @@ function parseRecos(full, title, desc, ts, src) {
 }
 
 function splitIntoSegments(text) {
-  // Split on: semicolons, "Also buy", "2)", numbered lists, company name transitions
-  const segs = text
-    .split(/;|(?=\\b(?:also|additionally|besides|another|second stock|third stock)\\b)/i)
-    .flatMap(s => s.split(/(?=\\d+[.)\\s]+(?:buy|sell|accumulate|target))/i))
-    .map(s => s.trim())
-    .filter(s => s.length > 20);
+  const segs = [];
 
-  // Always include full text as one segment too
-  if (!segs.includes(text)) segs.unshift(text);
-  return segs;
+  // Strategy 1: Split on numbered stock patterns — "1. Stock", "2) Stock", "Stock 1:"
+  const numbered = text.split(/(?=\\b\\d+[.)\\s]+(?:[A-Z][a-z]+|buy|sell))|(?=(?:first|second|third|fourth|fifth)\\s+(?:stock|pick|recommendation)\\s*:)/i);
+  segs.push(...numbered);
+
+  // Strategy 2: Split on "Stock Name: Buy at..." pattern — each stock gets its own block
+  // Handles: "RBL Bank: Buy at Rs 345, Target Rs 375, SL Rs 330"
+  const colonPattern = text.split(/(?=\\b[A-Z][A-Za-z\\s]{2,20}:\\s*(?:buy|sell|accumulate|target))/i);
+  segs.push(...colonPattern);
+
+  // Strategy 3: Split on stock transitions — new ticker after previous call ends
+  // "...Stop Loss Rs 330. Hero Motocorp: Buy at..."
+  const stoplossSplit = text.split(/(?<=(?:stop\\s*loss|stoploss|sl)[^.]*\\.\\s*)(?=[A-Z])/i);
+  segs.push(...stoplossSplit);
+
+  // Strategy 4: Pipe/dash separated lists
+  const pipeSplit = text.split(/\\s*[|]\\s*/);
+  segs.push(...pipeSplit);
+
+  // Strategy 5: Semicolon separated
+  const semiSplit = text.split(/;\\s*/);
+  segs.push(...semiSplit);
+
+  // Always include full text
+  segs.unshift(text);
+
+  return [...new Set(segs)].map(s => s.trim()).filter(s => s.length > 15);
 }
 
 function extractOneReco(text, title, ts, src) {
@@ -646,32 +753,40 @@ function extractOneReco(text, title, ts, src) {
     for (const re of patterns) {
       const m = str.match(re);
       if (m) {
-        const v = parseFloat((m[1] || m[2] || '0').replace(/,/g, ''));
+        // grab first capture group that is a number
+        const raw = m[1] || m[2] || m[3] || '0';
+        const v = parseFloat(raw.replace(/,/g, ''));
         if (v > 1 && v < 2000000) return v;
       }
     }
     return null;
   }
 
+  // Price prefix pattern handles both ₹ and Rs. and Rs
+  const P = '(?:₹|Rs\\\\.?\\\\s*)';
+
   let target = extractAfter([
-    /target\\s*(?:price|of|at|:|@)?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
-    /(?:tp|tgt)\\s*[:\\-@]?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
-    /price\\s+target\\s+(?:of\\s+)?(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
-    /(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)\\s*(?:as\\s+)?target/i,
+    new RegExp('target\\\\s*(?:price|of|at|:|@)?\\\\s*' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
+    new RegExp('(?:tp|tgt)\\\\s*[:\\\\-@]?\\\\s*' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
+    new RegExp('price\\\\s+target\\\\s+(?:of\\\\s+)?' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
+    new RegExp(P + '([\\\\d,]+(?:\\\\.\\\\d{1,2})?)\\\\s*(?:as\\\\s+)?target', 'i'),
+    /Target[:\\s]+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
   ], clean);
 
   let sl = extractAfter([
-    /stop\\s*[-\\s]?loss\\s*(?:at|of|:|@)?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
-    /stoploss\\s*(?:at|of|:|@)?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
-    /\\bsl\\b\\s*(?:at|of|:|@|-)?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
-    /(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)\\s*(?:as\\s+)?stop\\s*loss/i,
+    new RegExp('stop\\\\s*[-\\\\s]?loss\\\\s*(?:at|of|:|@)?\\\\s*' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
+    new RegExp('stoploss\\\\s*(?:at|of|:|@)?\\\\s*' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
+    new RegExp('\\\\bsl\\\\b\\\\s*(?:at|of|:|@|-)?\\\\s*' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
+    /Stop\\s*Loss[:\\s]+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
+    /SL[:\\s]+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
   ], clean);
 
   let entry = extractAfter([
-    /(?:buy|entry|enter)\\s*(?:at|@|around|near|above|below|price)?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
-    /\\bcmp\\b\\s*[:\\-@]?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
-    /(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)\\s*(?:level|zone|range)?\\s*(?:entry|for\\s+(?:buying|entry))/i,
-    /current\\s*(?:price|level|market\\s*price)?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
+    new RegExp('(?:buy|entry|enter)\\\\s*(?:at|@|around|near|above|below|price)?\\\\s*' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
+    new RegExp('\\\\bcmp\\\\b\\\\s*[:\\\\-@]?\\\\s*' + P + '?([\\\\d,]+(?:\\\\.\\\\d{1,2})?)', 'i'),
+    new RegExp(P + '([\\\\d,]+(?:\\\\.\\\\d{1,2})?)\\\\s*(?:entry|for\\\\s+(?:buying|entry))', 'i'),
+    /Buy\\s+at\\s+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
+    /current\\s+(?:market\\s+)?price[:\\s]+(?:Rs\\.?\\s*)?(\\d[\\d,.]+)/i,
   ], clean);
 
   // Last resort: collect all ₹ amounts and assign by position/logic
