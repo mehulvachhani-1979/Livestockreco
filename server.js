@@ -1,26 +1,20 @@
-// StockPulse India — Self-contained server (HTML embedded, no separate file needed)
+// StockPulse India — Self-contained (HTML embedded)
 // Deploy to Render.com: Start Command = node server.js
-// Local: node server.js then open http://localhost:3000
+// Local: node server.js → open http://localhost:3000
 
-const http = require('http');
+const http  = require('http');
 const https = require('https');
-const url = require('url');
-
-const PORT = process.env.PORT || 3000;
+const url   = require('url');
+const PORT  = process.env.PORT || 3000;
 
 const RSS_FEEDS = [
-  // ET — working fine
   { id:'et',   name:'ET Markets',        color:'#ff6600', initials:'ET', url:'https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms' },
   { id:'et2',  name:'ET Stocks',         color:'#ff6600', initials:'E2', url:'https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms' },
   { id:'et3',  name:'ET Hot Stocks',     color:'#ff6600', initials:'E3', url:'https://economictimes.indiatimes.com/markets/stocks/recos/rssfeeds/1977022822.cms' },
-  // LiveMint — working fine
   { id:'lm',   name:'LiveMint',          color:'#0080ff', initials:'LM', url:'https://www.livemint.com/rss/markets' },
-  { id:'lm2',  name:'LiveMint Stocks',   color:'#0080ff', initials:'L2', url:'https://www.livemint.com/rss/companies' },
-  // NDTV Profit — feedburner
+  { id:'lm2',  name:'LiveMint Companies',color:'#0080ff', initials:'L2', url:'https://www.livemint.com/rss/companies' },
   { id:'ndtv', name:'NDTV Profit',       color:'#e00000', initials:'NP', url:'https://feeds.feedburner.com/ndtvprofit-latest' },
-  // Financial Express — open RSS
   { id:'fe',   name:'Financial Express', color:'#006400', initials:'FE', url:'https://www.financialexpress.com/market/feed/' },
-  // Investing.com India RSS — open
   { id:'inv',  name:'Investing.com IN',  color:'#e84141', initials:'IV', url:'https://in.investing.com/rss/news.rss' },
 ];
 
@@ -30,9 +24,11 @@ function fetchUrl(targetUrl, redirectCount) {
     if (redirectCount > 5) return reject(new Error('Too many redirects'));
     const req = https.get(targetUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'application/rss+xml, application/xml, text/xml, */*',
-        'Accept-Language': 'en-IN,en;q=0.9',
+        'Accept-Language': 'en-IN,en-US;q=0.9,en;q=0.8',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
       },
       timeout: 12000,
     }, (res) => {
@@ -52,19 +48,19 @@ const cache = { data: null, ts: 0, TTL: 10 * 60 * 1000 };
 
 async function getAllFeeds() {
   if (cache.data && (Date.now() - cache.ts) < cache.TTL) {
-    console.log('Serving from cache');
+    console.log('Serving cached feeds');
     return cache.data;
   }
   console.log('Fetching RSS feeds...');
   const results = [];
   for (const feed of RSS_FEEDS) {
-    console.log(' Fetching ' + feed.name + '...');
+    process.stdout.write('  ' + feed.name + '... ');
     try {
       const { status, body } = await fetchUrl(feed.url);
-      console.log(' ' + feed.name + ': ' + status + ', ' + body.length + ' bytes');
+      console.log('HTTP', status, body.length + 'b');
       results.push({ id: feed.id, name: feed.name, color: feed.color, initials: feed.initials, status, xml: body });
     } catch(e) {
-      console.log(' ' + feed.name + ': ERROR ' + e.message);
+      console.log('ERROR:', e.message);
       results.push({ id: feed.id, name: feed.name, color: feed.color, initials: feed.initials, status: 0, xml: '', error: e.message });
     }
   }
@@ -502,12 +498,13 @@ async function fetchAll(){
 
       const items = parseXML(feed.xml, feed.id);
       let srcAdded=0;
-      for(const item of items.slice(0,25)){
+      for(const item of items.slice(0,30)){
         const full = item.title+' '+item.desc;
-        const parsed = parseReco(full, item.title, item.desc, item.ts, feed);
-        if(parsed){
-          const dup=recos.find(x=>x.ticker===parsed.ticker&&x.source===feed.id&&Math.abs(x.ts-item.ts)<12*3600000);
-          if(!dup){ recos.unshift({...parsed,id:nextId++,source:feed.id,sourceName:feed.name,link:item.link,auto:true}); srcAdded++; totalAdded++; }
+        // parseRecos returns array — one article can yield multiple stock calls
+        const parsed = parseRecos(full, item.title, item.desc, item.ts, feed);
+        for(const p of parsed){
+          const dup=recos.find(x=>x.ticker===p.ticker&&x.source===feed.id&&Math.abs(x.ts-item.ts)<12*3600000);
+          if(!dup){ recos.unshift({...p,id:nextId++,source:feed.id,sourceName:feed.name,link:item.link,auto:true}); srcAdded++; totalAdded++; }
         }
       }
       updateLastStep(srcAdded>0?'done':'info',
@@ -553,66 +550,168 @@ function parseXML(xmlText, srcId){
   }catch(e){ return []; }
 }
 
-// ── RECOMMENDATION PARSER ─────────────────────────────────────────────────────
-function parseReco(full, title, desc, ts, src){
-  const buyRe  = /\\\\b(buy|buying|accumulate|bullish|target|upside|outperform|overweight|multibagger|breakout|strong buy|add on dips|top pick|recommended|initiates buy|upgrades to buy|trading buy|positive)\\\\b/i;
-  const sellRe = /\\\\b(sell|selling|short|strong sell|exit|reduce|bearish|underperform|underweight|avoid|downgrades|initiates sell)\\\\b/i;
-  const watchRe= /\\\\b(watchlist|watch list|top pick|hot stock|stocks? to buy|pick of the day|recommended stock|trading idea|trade setup|stock idea|analyst pick|brokerage pick)\\\\b/i;
+// ── RECOMMENDATION PARSER — multi-stock, full extraction ─────────────────────
 
-  const hasBuy  = buyRe.test(full);
-  const hasSell = sellRe.test(full);
-  const hasWatch= watchRe.test(full);
-  if(!hasBuy && !hasSell && !hasWatch) return null;
+// Returns ARRAY of reco objects (one article can have 2-3 stocks)
+function parseRecos(full, title, desc, ts, src) {
+  const results = [];
 
-  let ticker=null, cname=null;
-  for(const [re,sym,cn] of TICKER_MAP){
-    if(re.test(full)){ ticker=sym; cname=cn; break; }
-  }
-  // If no known ticker found, try to extract from "Buy XYZ" / "stock XYZ" patterns
-  if(!ticker){
-    const buyMatch = full.match(/\\b(?:buy|sell|accumulate|target)\\s+([A-Z]{2,10})\\b/);
-    const stockMatch = full.match(/\\b([A-Z]{3,10})\\s+(?:shares?|stock|scrip)/i);
-    if(buyMatch && buyMatch[1].length>=3){ ticker=buyMatch[1]; cname=buyMatch[1]; }
-    else if(stockMatch){ ticker=stockMatch[1].toUpperCase(); cname=ticker; }
-    else return null;
-  }
+  // ── Step 1: Split article into per-stock segments ──────────────────────────
+  // Articles often say "Buy A with target X, SL Y; Buy B with target P, SL Q"
+  // Split on sentence boundaries or semicolons or stock transitions
+  const segments = splitIntoSegments(full);
 
-  const action = hasBuy?'BUY': hasSell?'SELL':'WATCH';
-
-  // Price extraction
-  let target=null, sl=null, entry=null;
-  const tRe=/target(?:\\s*price|\\s*of|\\s*at|\\s*:)?\\s*(?:₹|rs\\.?\\s*|inr\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/gi;
-  const sRe=/(?:stop[\\s-]?loss|stoploss|\\bsl\\b)(?:\\s*at|\\s*of|\\s*:|\\s*@)?\\s*(?:₹|rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/gi;
-  const eRe=/(?:entry|buy\\s*at|buy\\s*around|buy\\s*near|buy\\s*above|buy\\s*below|cmp|at\\s*cmp|\\baround\\b|\\bnear\\b)(?:\\s*:|\\s*of|\\s*@|\\s*at|\\s*near)?\\s*(?:₹|rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)/gi;
-
-  let m;
-  while((m=tRe.exec(full))!==null){ const v=parseFloat(m[1].replace(/,/g,'')); if(v>1&&v<1000000){target=v;break;}}
-  while((m=sRe.exec(full))!==null){ const v=parseFloat(m[1].replace(/,/g,'')); if(v>1&&v<1000000){sl=v;break;}}
-  while((m=eRe.exec(full))!==null){ const v=parseFloat(m[1].replace(/,/g,'')); if(v>1&&v<1000000){entry=v;break;}}
-
-  // Fallback from ₹ amounts
-  if(!entry||!target){
-    const priceRe=/(?:₹|rs\\.?)\\s*([\\d,]+(?:\\.\\d{1,2})?)/gi;
-    const prices=[];
-    while((m=priceRe.exec(full))!==null){ const v=parseFloat(m[1].replace(/,/g,'')); if(v>1&&v<1000000) prices.push(v); }
-    if(prices.length>=2){
-      const s=[...new Set(prices)].sort((a,b)=>a-b);
-      if(action==='BUY'){  if(!entry) entry=s[0]; if(!target) target=s[s.length-1]; }
-      if(action==='SELL'){ if(!entry) entry=s[s.length-1]; if(!target) target=s[0]; }
+  // ── Step 2: Extract from each segment ──────────────────────────────────────
+  for (const seg of segments) {
+    const rec = extractOneReco(seg, title, ts, src);
+    if (rec) {
+      // Avoid duplicate tickers in same article
+      if (!results.find(r => r.ticker === rec.ticker)) {
+        results.push(rec);
+      }
     }
   }
 
-  // Anchor
-  let anchor='Market Desk';
-  const fl=full.toLowerCase();
-  for(const name of KNOWN_ANCHORS){ if(fl.includes(name.toLowerCase())){ anchor=name; break; } }
-  if(anchor==='Market Desk'){
-    const am=full.match(/([A-Z][a-z]+(?: [A-Z][a-z]+)+)\\s+(?:of\\s+[\\w\\s]+\\s+)?(?:recommends?|suggests?|says|advises?)/);
-    if(am) anchor=am[1];
+  // If segmented extraction got nothing, try whole article
+  if (results.length === 0) {
+    const rec = extractOneReco(full, title, ts, src);
+    if (rec) results.push(rec);
   }
 
-  const snippet=(title.length>10?title:desc).substring(0,160);
-  return { ticker, cname, action, entry, sl, target, anchor, snippet, ts };
+  return results;
+}
+
+function splitIntoSegments(text) {
+  // Split on: semicolons, "Also buy", "2)", numbered lists, company name transitions
+  const segs = text
+    .split(/;|(?=\\b(?:also|additionally|besides|another|second stock|third stock)\\b)/i)
+    .flatMap(s => s.split(/(?=\\d+[.)\\s]+(?:buy|sell|accumulate|target))/i))
+    .map(s => s.trim())
+    .filter(s => s.length > 20);
+
+  // Always include full text as one segment too
+  if (!segs.includes(text)) segs.unshift(text);
+  return segs;
+}
+
+function extractOneReco(text, title, ts, src) {
+  const t = text.toLowerCase();
+
+  // ── Action detection ────────────────────────────────────────────────────────
+  const isBuy  = /\\b(buy|buying|accumulate|add|bullish|long|go long|initiat(e|es|ing) buy|upgrade.*buy|maintain.*buy|strong buy|top pick|best buy|recommended buy|trading buy|invest)\\b/.test(text);
+  const isSell = /\\b(sell|selling|short|exit|reduce|bearish|avoid|downgrade.*sell|initiat(e|es|ing) sell|book profit|book loss)\\b/.test(text);
+  const isWatch= /\\b(watch|watchlist|neutral|hold|tracking|monitor|top pick|hot stock|trade setup|trading idea|stock idea|analyst pick)\\b/.test(text);
+
+  if (!isBuy && !isSell && !isWatch) return null;
+  const action = isBuy ? 'BUY' : isSell ? 'SELL' : 'WATCH';
+
+  // ── Ticker extraction ───────────────────────────────────────────────────────
+  let ticker = null, cname = null;
+
+  // 1. Try known ticker map
+  for (const [re, sym, cn] of TICKER_MAP) {
+    if (re.test(text)) { ticker = sym; cname = cn; break; }
+  }
+
+  // 2. Pattern: "Buy XYZ" / "Sell XYZ" / "XYZ: Buy"
+  if (!ticker) {
+    const patterns = [
+      /\\b(?:buy|sell|accumulate|add)\\s+([A-Z][A-Za-z&]{2,15})\\b/,
+      /\\b([A-Z][A-Za-z&]{2,15})\\s*[:|]\\s*(?:buy|sell|target)/i,
+      /\\b([A-Z][A-Za-z&]{2,15})\\s+(?:shares?|stock|scrip|futures?)\\b/i,
+      /\\b([A-Z]{3,10})\\s+(?:at|@|around|near)\\s*(?:₹|rs\\.?)?\\s*[\\d,]+/,
+    ];
+    for (const p of patterns) {
+      const m = text.match(p);
+      if (m && m[1] && m[1].length >= 3 && !/^(buy|sell|the|and|for|with|stop|loss|target|price|near|above|below)$/i.test(m[1])) {
+        ticker = m[1].toUpperCase();
+        cname  = m[1];
+        break;
+      }
+    }
+  }
+
+  if (!ticker) return null;
+
+  // ── Price extraction ─────────────────────────────────────────────────────────
+  // Clean text: remove HTML, normalise ₹ and Rs
+  const clean = text
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/Rs\\.?\\s*/gi, '₹')
+    .replace(/INR\\s*/gi,   '₹')
+    .replace(/rupees?\\s*/gi,'₹');
+
+  // Helper: extract number after a keyword
+  function extractAfter(patterns, str) {
+    for (const re of patterns) {
+      const m = str.match(re);
+      if (m) {
+        const v = parseFloat((m[1] || m[2] || '0').replace(/,/g, ''));
+        if (v > 1 && v < 2000000) return v;
+      }
+    }
+    return null;
+  }
+
+  const target = extractAfter([
+    /target\\s*(?:price|of|at|:|@)?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
+    /(?:tp|tgt)\\s*[:\\-@]?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
+    /price\\s+target\\s+(?:of\\s+)?(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
+    /(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)\\s*(?:as\\s+)?target/i,
+  ], clean);
+
+  const sl = extractAfter([
+    /stop\\s*[-\\s]?loss\\s*(?:at|of|:|@)?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
+    /stoploss\\s*(?:at|of|:|@)?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
+    /\\bsl\\b\\s*(?:at|of|:|@|-)?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
+    /(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)\\s*(?:as\\s+)?stop\\s*loss/i,
+  ], clean);
+
+  const entry = extractAfter([
+    /(?:buy|entry|enter)\\s*(?:at|@|around|near|above|below|price)?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
+    /\\bcmp\\b\\s*[:\\-@]?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
+    /(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)\\s*(?:level|zone|range)?\\s*(?:entry|for\\s+(?:buying|entry))/i,
+    /current\\s*(?:price|level|market\\s*price)?\\s*(?:₹)?\\s*([\\d,]+(?:\\.\\d{1,2})?)/i,
+  ], clean);
+
+  // Last resort: collect all ₹ amounts and assign by position/logic
+  if (!entry || !target) {
+    const allPrices = [];
+    const priceRe = /(?:₹|@\\s*)([\\d,]+(?:\\.\\d{1,2})?)/g;
+    let pm;
+    while ((pm = priceRe.exec(clean)) !== null) {
+      const v = parseFloat(pm[1].replace(/,/g,''));
+      if (v > 1 && v < 2000000) allPrices.push(v);
+    }
+    const unique = [...new Set(allPrices)].sort((a,b)=>a-b);
+    if (unique.length >= 2) {
+      if (action === 'BUY')  { if (!entry) entry = unique[0]; if (!target) target = unique[unique.length-1]; }
+      if (action === 'SELL') { if (!entry) entry = unique[unique.length-1]; if (!target) target = unique[0]; }
+    } else if (unique.length === 1) {
+      if (!target) target = unique[0];
+    }
+  }
+
+  // ── Anchor extraction ────────────────────────────────────────────────────────
+  let anchor = 'Market Desk';
+  const tl = text.toLowerCase();
+  for (const name of KNOWN_ANCHORS) {
+    if (tl.includes(name.toLowerCase())) { anchor = name; break; }
+  }
+  if (anchor === 'Market Desk') {
+    // "Rahul Shah of Motilal recommends" / "said Kunal Shah"
+    const am = text.match(/([A-Z][a-z]+(?: [A-Z][a-z]+){1,3})\\s+(?:of\\s+[\\w\\s]+?\\s+)?(?:recommends?|suggests?|says?|advises?|told|picks?)/);
+    if (am) anchor = am[1];
+  }
+
+  const snippet = (title && title.length > 10 ? title : text).substring(0, 180);
+  return { ticker, cname, action, entry: entry||null, sl: sl||null, target: target||null, anchor, snippet, ts };
+}
+
+// Legacy single-call wrapper (for backward compat)
+function parseReco(full, title, desc, ts, src) {
+  const arr = parseRecos(full, title, desc, ts, src);
+  return arr.length > 0 ? arr[0] : null;
 }
 
 // ── RENDER ────────────────────────────────────────────────────────────────────
@@ -759,7 +858,6 @@ const server = http.createServer(async (req, res) => {
     res.end(HTML);
     return;
   }
-
   if (parsed.pathname === '/api/feeds') {
     try {
       const data = await getAllFeeds();
@@ -771,16 +869,14 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
-
   if (parsed.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', ts: Date.now() }));
     return;
   }
-
   res.writeHead(404); res.end('Not found');
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('StockPulse India running on http://localhost:' + PORT);
+  console.log('\nStockPulse India running → http://localhost:' + PORT + '\n');
 });
