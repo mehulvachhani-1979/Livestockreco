@@ -870,7 +870,9 @@ function extractOneReco(text, title, ts, src) {
   }
 
   const snippet = (title && title.length > 10 ? title : text).substring(0, 180);
-  return { ticker, cname, action, entry: entry||null, sl: sl||null, target: target||null, anchor, snippet, ts };
+  // Store the raw segment text — shown directly in the card
+  const rawText = text.length > 30 ? text.substring(0, 600) : (title||'');
+  return { ticker, cname, action, entry: entry||null, sl: sl||null, target: target||null, anchor, snippet, rawText, ts };
 }
 
 // Legacy single-call wrapper (for backward compat)
@@ -911,36 +913,30 @@ function render(){
   }
   g.innerHTML=arts.map(r=>{
     const c=srcInfo(r.source);
-    const rr=rrCalc(r);
-    const ep=fmtP(r.entry),sp=fmtP(r.sl),tp=fmtP(r.target);
-    const hasPrice=ep||sp||tp;
-    let rrHtml='';
-    if(rr){const tot=rr.risk+rr.reward||1,lw=Math.round(rr.risk/tot*100),gw=Math.round(rr.reward/tot*100);
-      rrHtml=\`<div class="rr-row"><span>R:R</span><div class="rr-bar"><div class="rr-loss" style="width:\${lw}%"></div><div class="rr-gain" style="width:\${gw}%"></div></div><span class="rr-val">1:\${rr.ratio}</span></div>\`;}
-    return \`<div class="rcard \${r.action.toLowerCase()}">
-      <div class="rcard-top">
-        <div><div class="ticker-big">\${r.ticker}</div><div class="cname">\${r.cname}</div></div>
-        <div class="right-top">
-          <span class="action-badge \${r.action.toLowerCase()}">\${r.action}</span>
-          <button class="del-btn" onclick="del(\${r.id})"><i class="ti ti-x"></i></button>
+    const actionColor = r.action==='BUY'?'#10b981':r.action==='SELL'?'#e24b4a':'#d97706';
+    const actionBg    = r.action==='BUY'?'#dcfce7':r.action==='SELL'?'#fee2e2':'#fef3c7';
+    const actionTxt   = r.action==='BUY'?'#166534':r.action==='SELL'?'#991b1b':'#92400e';
+    return \`<div style="background:#fff;border:1px solid #e5e7eb;border-left:4px solid \${actionColor};border-radius:12px;padding:14px 16px;margin-bottom:10px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+        <div>
+          <span style="font-family:monospace;font-size:18px;font-weight:700;color:#1a1a2e;">\${r.ticker}</span>
+          <span style="font-size:11px;color:#6b7280;margin-left:8px;">\${r.cname}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span style="background:\${actionBg};color:\${actionTxt};font-size:11px;font-weight:700;padding:3px 12px;border-radius:20px;">\${r.action}</span>
+          <button onclick="del(\${r.id})" style="background:none;border:none;color:#9ca3af;cursor:pointer;font-size:15px;padding:0;line-height:1;">×</button>
         </div>
       </div>
-      \${hasPrice?\`<div class="price-row">
-        <div class="pbox"><div class="pbox-label">Entry</div><div class="pbox-val entry">\${ep||'<span class="pbox-na">—</span>'}</div></div>
-        <div class="pbox"><div class="pbox-label">Stop Loss</div><div class="pbox-val sl">\${sp||'<span class="pbox-na">—</span>'}</div></div>
-        <div class="pbox"><div class="pbox-label">Target</div><div class="pbox-val tgt">\${tp||'<span class="pbox-na">—</span>'}</div></div>
-      </div>\`:''}
-      \${rrHtml}
-      \${r.snippet?\`<div class="snippet">\${r.snippet.substring(0,160)}\${r.snippet.length>160?'…':''}</div>\`:''}
-      <div class="src-footer">
-        <div class="src-logo" style="background:\${c.color}20;color:\${c.color};border-color:\${c.color}50">\${c.initials}</div>
-        <div class="src-info">
-          <div class="src-channel">\${r.sourceName||c.name}</div>
-          <div class="src-anchor"><i class="ti ti-microphone" style="font-size:10px"></i>\${r.anchor}</div>
+      <div style="background:#f8f9fb;border-radius:8px;padding:12px 14px;font-size:13px;color:#374151;line-height:1.8;white-space:pre-wrap;font-family:system-ui,sans-serif;border:1px solid #e5e7eb;">\${(r.rawText||r.snippet||'').trim().substring(0,600)}</div>
+      <div style="display:flex;align-items:center;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid #f3f4f6;">
+        <div style="width:24px;height:24px;border-radius:50%;background:\${c.color}20;color:\${c.color};border:1px solid \${c.color}50;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;flex-shrink:0;">\${c.initials}</div>
+        <div style="flex:1;min-width:0;">
+          <div style="font-size:11px;font-weight:600;color:#1a1a2e;">\${r.sourceName||c.name}</div>
+          <div style="font-size:10px;color:#6b7280;">🎙 \${r.anchor}</div>
         </div>
-        <span class="src-time"><i class="ti ti-clock" style="font-size:10px"></i>\${ta(r.ts)}</span>
-        \${r.auto?'<span class="auto-tag">Auto</span>':''}
-        \${r.link?\`<a class="read-link" href="\${r.link}" target="_blank" rel="noopener"><i class="ti ti-external-link" style="font-size:10px"></i>Read</a>\`:''}
+        <span style="font-size:10px;color:#9ca3af;">🕐 \${ta(r.ts)}</span>
+        \${r.auto?'<span style="font-size:9px;background:#e0f2fe;color:#0369a1;border-radius:4px;padding:1px 6px;border:1px solid #bae6fd;">Auto</span>':''}
+        \${r.link?\`<a href="\${r.link}" target="_blank" rel="noopener" style="font-size:10px;color:#1D9E75;text-decoration:none;">↗ Read</a>\`:''}
       </div>
     </div>\`;
   }).join('');
